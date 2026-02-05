@@ -10,6 +10,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'pio run[^-]|pio run$' && [ \"$CLAUDE_TOOL_STATUS\" = \"0\" ]; then echo '--- Auto-flashing ---'; pio run -t upload 2>&1 | tail -15; fi"
+          }
+        ]
+      }
     ]
   }
 }
