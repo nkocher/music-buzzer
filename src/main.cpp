@@ -437,12 +437,12 @@ void setupNote(MelodyPlayer& p) {
     uint16_t freq = p.melody[p.noteIndex][0];
     uint16_t duration = p.melody[p.noteIndex][1];
     if (freq > 0) {
-        if (p.octaveShift > 0) {
-            for (int8_t i = 0; i < p.octaveShift; i++) freq *= 2;
-        } else if (p.octaveShift < 0) {
-            for (int8_t i = 0; i < -p.octaveShift; i++) freq /= 2;
-        }
-        if (freq < 65) freq = 65;   // C2, lowest usable on most passive buzzers
+        // Apply octave shift via bit shifting (each octave doubles/halves frequency)
+        if (p.octaveShift > 0) freq <<= p.octaveShift;
+        else if (p.octaveShift < 0) freq >>= -p.octaveShift;
+
+        // Clamp to usable range for passive buzzers
+        if (freq < 65) freq = 65;
         if (freq > 4000) freq = 4000;
 
         // Software PWM via timer ISR — phase-continuous, no first-cycle glitch
@@ -499,12 +499,13 @@ void assignTracks(SongEntry& song) {
     }
 
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
-        players[i].buzzerPin = buzzerPins[i];
-        players[i].ledcChannel = i;
-        players[i].octaveShift = 0;
-        players[i].melody = nullptr;
-        players[i].length = 0;
-        players[i].playing = false;
+        MelodyPlayer& p = players[i];
+        p.buzzerPin = buzzerPins[i];
+        p.ledcChannel = i;
+        p.octaveShift = 0;
+        p.melody = nullptr;
+        p.length = 0;
+        p.playing = false;
     }
 
     if (available == 0) return;
@@ -533,13 +534,14 @@ void assignTracks(SongEntry& song) {
 
     unsigned long startTime = millis();
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
-        if (players[i].melody && players[i].length > 0) {
-            players[i].noteIndex = 0;
-            players[i].playing = true;
-            players[i].inGap = false;
-            players[i].inLoopPause = false;
-            players[i].noteStartedAt = startTime;
-            setupNote(players[i]);
+        MelodyPlayer& p = players[i];
+        if (p.melody && p.length > 0) {
+            p.noteIndex = 0;
+            p.playing = true;
+            p.inGap = false;
+            p.inLoopPause = false;
+            p.noteStartedAt = startTime;
+            setupNote(p);
         }
     }
 
@@ -557,17 +559,17 @@ void stopAllBuzzers() {
     // Disable timer ISR first to stop all GPIO activity
     timerAlarmDisable(audioTimer);
 
+    uint32_t allPinsMask = 0;
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
         players[i].playing = false;
         buzzerPWM[i].phaseInc = 0;
         buzzerPWM[i].phase = 0;
         buzzerPWM[i].dutyOn = 0;
+        allPinsMask |= buzzerPinMasks[i];
     }
-    // Force all buzzer pins LOW immediately (prevents stuck-high pins)
-    GPIO.out_w1tc = buzzerPinMasks[0] | buzzerPinMasks[1] | buzzerPinMasks[2] |
-                    buzzerPinMasks[3] | buzzerPinMasks[4];
 
-    // Switch pins to INPUT mode (high-impedance) for true silence
+    // Force all buzzer pins LOW, then switch to INPUT for true silence
+    GPIO.out_w1tc = allPinsMask;
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
         pinMode(buzzerPins[i], INPUT);
     }
@@ -1032,11 +1034,12 @@ void loop() {
         Serial.println("[LOOP] All tracks finished — restarting");
         unsigned long startTime = millis();
         for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
-            if (players[i].playing) {
-                players[i].noteIndex = 0;
-                players[i].inLoopPause = false;
-                players[i].noteStartedAt = startTime;
-                setupNote(players[i]);
+            MelodyPlayer& p = players[i];
+            if (p.playing) {
+                p.noteIndex = 0;
+                p.inLoopPause = false;
+                p.noteStartedAt = startTime;
+                setupNote(p);
             }
         }
     }
