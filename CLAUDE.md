@@ -26,6 +26,10 @@ Do NOT use Core 3.x functions like `ledcAttachChannel()` or pin-based `ledcWrite
 - Channels 0-4 map to buzzers on GPIO 4,5,6,7,15
 - LEDC resolution: 8-bit
 
+### Hardware Limitations
+- Passive buzzers: volume cannot be software-controlled (ledcWriteTone sets 50% duty cycle internally)
+- Volume control would require hardware modification (potentiometer/amplifier) or active buzzers
+
 ## File Structure
 
 ```
