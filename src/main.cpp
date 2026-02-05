@@ -6,9 +6,10 @@
 
 // ---------- state ----------
 enum State { IDLE, PLAYING };
-State state = IDLE;
-unsigned long stateEnteredAt = 0;
+volatile State state = IDLE;
+volatile unsigned long stateEnteredAt = 0;
 unsigned long lastWifiCheck = 0;
+uint8_t volumePercent = DEFAULT_VOLUME;
 
 // ---------- note frequency helper ----------
 static const uint16_t NOTE_FREQS[12] = { 262,277,294,311,330,349,370,392,415,440,466,494 }; // C4..B4
@@ -48,7 +49,6 @@ uint16_t parseRTTTL(const char* rtttl, uint16_t out[][2], uint16_t maxNotes) {
     p++;
 
     if (bpm == 0) bpm = 63;
-    uint32_t wholeNote = (60000UL * 4) / bpm;
     uint16_t count = 0;
 
     while (*p && count < maxNotes) {
@@ -75,8 +75,9 @@ uint16_t parseRTTTL(const char* rtttl, uint16_t out[][2], uint16_t maxNotes) {
             p++; continue;
         }
 
-        uint16_t ms = wholeNote / dur;
-        if (*p == '.') { ms = ms + ms / 2; p++; }
+        uint32_t divisor = (uint32_t)bpm * dur;
+        uint16_t ms = (uint16_t)((240000UL + divisor / 2) / divisor);
+        if (*p == '.') { ms = (ms * 3 + 1) / 2; p++; }
 
         out[count][0] = freq;
         out[count][1] = ms;
@@ -94,6 +95,27 @@ uint16_t parseMML(const char* mml, uint16_t out[][2], uint16_t maxNotes, uint8_t
     const char* end = p;
     while (*end && *end != ';') end++;
 
+    // Scan Track 0 preamble for initial tempo (applies to all tracks)
+    uint16_t initTempo = 120;
+    {
+        const char* s = p;
+        const char* t0end = s;
+        while (t0end < end && *t0end != ',') t0end++;
+        while (s < t0end) {
+            char c = *s;
+            if ((c >= 'a' && c <= 'g') || (c >= 'A' && c <= 'G') || c == 'r' || c == 'R')
+                break; // stop at first note/rest
+            if (c == 't' || c == 'T') {
+                s++;
+                uint16_t val = 0;
+                while (s < t0end && *s >= '0' && *s <= '9') { val = val*10 + (*s-'0'); s++; }
+                if (val > 0) initTempo = val;
+            } else {
+                s++;
+            }
+        }
+    }
+
     uint8_t currentTrack = 0;
     while (currentTrack < track && p < end) {
         if (*p == ',') { currentTrack++; if (currentTrack == track) { p++; break; } }
@@ -106,7 +128,7 @@ uint16_t parseMML(const char* mml, uint16_t out[][2], uint16_t maxNotes, uint8_t
 
     uint8_t octave = 4;
     uint8_t defaultLength = 4;
-    uint16_t tempo = 120;
+    uint16_t tempo = initTempo;
     uint16_t count = 0;
 
     while (p < trackEnd && count < maxNotes) {
@@ -162,10 +184,11 @@ uint16_t parseMML(const char* mml, uint16_t out[][2], uint16_t maxNotes, uint8_t
         while (p < trackEnd && *p >= '0' && *p <= '9') { noteLen = noteLen*10 + (*p-'0'); p++; }
         if (noteLen == 0) noteLen = defaultLength;
 
-        uint32_t wholeNote = (60000UL * 4) / tempo;
-        uint32_t ms = wholeNote / noteLen;
+        // Single rounded division to avoid double-truncation drift between tracks
+        uint32_t divisor = (uint32_t)tempo * noteLen;
+        uint32_t ms = (240000UL + divisor / 2) / divisor;
 
-        if (p < trackEnd && *p == '.') { ms = ms + ms/2; p++; }
+        if (p < trackEnd && *p == '.') { ms = (ms * 3 + 1) / 2; p++; }
 
         while (p < trackEnd && *p == '&') {
             p++;
@@ -178,8 +201,10 @@ uint16_t parseMML(const char* mml, uint16_t out[][2], uint16_t maxNotes, uint8_t
             uint8_t tieLen = 0;
             while (p < trackEnd && *p >= '0' && *p <= '9') { tieLen = tieLen*10 + (*p-'0'); p++; }
             if (tieLen == 0) tieLen = defaultLength;
-            ms += wholeNote / tieLen;
-            if (p < trackEnd && *p == '.') { ms += (wholeNote / tieLen) / 2; p++; }
+            uint32_t tieDivisor = (uint32_t)tempo * tieLen;
+            uint32_t tieMs = (240000UL + tieDivisor / 2) / tieDivisor;
+            if (p < trackEnd && *p == '.') { tieMs = (tieMs * 3 + 1) / 2; p++; }
+            ms += tieMs;
         }
 
         if (ms > 65535) ms = 65535;
@@ -201,7 +226,7 @@ struct SongEntry {
     const char* name;
     SongFmt fmt;
     uint8_t trackCount;
-    TrackData tracks[4];
+    TrackData tracks[MAX_TRACKS];
     bool parsed;
 };
 
@@ -226,7 +251,7 @@ uint8_t countMMLTracks(const char* mml) {
 
 void freeSongTracks(SongEntry& song) {
     if (!song.parsed) return;
-    for (uint8_t t = 0; t < 4; t++) {
+    for (uint8_t t = 0; t < MAX_TRACKS; t++) {
         if (song.tracks[t].notes) {
             free(song.tracks[t].notes);
             song.tracks[t].notes = nullptr;
@@ -253,38 +278,56 @@ bool parseSongTracks(uint16_t songIdx) {
     }
     strncpy_P(strBuf, song.progmemStr, STR_BUF_SZ - 1);
     strBuf[STR_BUF_SZ - 1] = '\0';
+    Serial.printf("[PARSE] Song #%d: fmt=%d, strLen=%d, tracks=%d\n",
+        songIdx, song.fmt, len, song.trackCount);
 
-    uint16_t tempBuf[MAX_NOTES_PER_SONG][2];
+    uint16_t (*tempBuf)[2] = (uint16_t(*)[2])malloc(MAX_NOTES_PER_SONG * sizeof(uint16_t[2]));
+    if (!tempBuf) { free(strBuf); Serial.println("[PARSE] tempBuf malloc failed"); return false; }
+    Serial.printf("[PARSE] tempBuf alloc OK, heap=%u\n", ESP.getFreeHeap());
 
     if (song.fmt == FMT_RTTTL) {
         uint16_t count = parseRTTTL(strBuf, tempBuf, MAX_NOTES_PER_SONG);
-        if (count == 0) { free(strBuf); return false; }
+        Serial.printf("[PARSE] RTTTL parsed: %d notes\n", count);
+        if (count == 0) { free(tempBuf); free(strBuf); return false; }
         uint16_t (*notes)[2] = (uint16_t(*)[2])malloc(count * sizeof(uint16_t[2]));
-        if (!notes) { free(strBuf); return false; }
+        if (!notes) { free(tempBuf); free(strBuf); return false; }
         memcpy(notes, tempBuf, count * sizeof(uint16_t[2]));
         song.tracks[0] = { notes, count };
-        for (uint8_t t = 1; t < 4; t++) song.tracks[t] = { nullptr, 0 };
+        for (uint8_t t = 1; t < MAX_TRACKS; t++) song.tracks[t] = { nullptr, 0 };
     } else {
-        uint8_t tracksToparse = song.trackCount < 4 ? song.trackCount : 4;
+        uint8_t tracksToparse = song.trackCount < MAX_TRACKS ? song.trackCount : MAX_TRACKS;
         for (uint8_t t = 0; t < tracksToparse; t++) {
             uint16_t count = parseMML(strBuf, tempBuf, MAX_NOTES_PER_SONG, t);
+            Serial.printf("[PARSE] MML track %d: %d notes\n", t, count);
             if (count == 0) {
                 song.tracks[t] = { nullptr, 0 };
                 continue;
             }
             uint16_t (*notes)[2] = (uint16_t(*)[2])malloc(count * sizeof(uint16_t[2]));
             if (!notes) {
+                Serial.printf("[PARSE] Track %d notes malloc failed!\n", t);
                 song.tracks[t] = { nullptr, 0 };
                 continue;
             }
             memcpy(notes, tempBuf, count * sizeof(uint16_t[2]));
             song.tracks[t] = { notes, count };
         }
-        for (uint8_t t = tracksToparse; t < 4; t++) song.tracks[t] = { nullptr, 0 };
+        for (uint8_t t = tracksToparse; t < MAX_TRACKS; t++) song.tracks[t] = { nullptr, 0 };
     }
 
+    free(tempBuf);
     free(strBuf);
     song.parsed = true;
+    for (uint8_t t = 0; t < MAX_TRACKS; t++) {
+        if (song.tracks[t].notes && song.tracks[t].length > 0) {
+            uint32_t totalMs = 0;
+            for (uint16_t n = 0; n < song.tracks[t].length; n++)
+                totalMs += song.tracks[t].notes[n][1];
+            Serial.printf("[PARSE] Track %d: %d notes, %ums total\n",
+                t, song.tracks[t].length, totalMs);
+        }
+    }
+    Serial.printf("[PARSE] Done, heap=%u\n", ESP.getFreeHeap());
     return true;
 }
 
@@ -316,7 +359,7 @@ void parseSongDefs() {
         songs[SONG_COUNT].fmt = def.fmt;
         songs[SONG_COUNT].trackCount = tc;
         songs[SONG_COUNT].parsed = false;
-        for (uint8_t t = 0; t < 4; t++) songs[SONG_COUNT].tracks[t] = { nullptr, 0 };
+        for (uint8_t t = 0; t < MAX_TRACKS; t++) songs[SONG_COUNT].tracks[t] = { nullptr, 0 };
         SONG_COUNT++;
     }
 
@@ -325,7 +368,7 @@ void parseSongDefs() {
 }
 
 // ---------- multi-track melody player ----------
-static const uint8_t buzzerPins[NUM_BUZZERS] = { PIN_BUZ0, PIN_BUZ1, PIN_BUZ2, PIN_BUZ3 };
+static const uint8_t buzzerPins[NUM_BUZZERS] = { PIN_BUZ0, PIN_BUZ1, PIN_BUZ2, PIN_BUZ3, PIN_BUZ4 };
 
 struct MelodyPlayer {
     const uint16_t (*melody)[2];
@@ -344,7 +387,8 @@ struct MelodyPlayer {
 MelodyPlayer players[NUM_BUZZERS];
 int16_t currentSongIndex = -1;
 
-void playCurrentNote(MelodyPlayer& p) {
+// Set up buzzer output for current note (does NOT touch timing)
+void setupNote(MelodyPlayer& p) {
     uint16_t freq = p.melody[p.noteIndex][0];
     uint16_t duration = p.melody[p.noteIndex][1];
     if (freq > 0) {
@@ -353,61 +397,50 @@ void playCurrentNote(MelodyPlayer& p) {
         } else if (p.octaveShift < 0) {
             for (int8_t i = 0; i < -p.octaveShift; i++) freq /= 2;
         }
-        if (freq < 131) freq = 131;
+        if (freq < 65) freq = 65;   // C2, lowest usable on most passive buzzers
         if (freq > 4000) freq = 4000;
 
-        ledcAttachPin(p.buzzerPin, p.ledcChannel);
+        // ledcWriteTone changes freq without stopping PWM (no glitch between notes)
         ledcWriteTone(p.ledcChannel, freq);
+        ledcWrite(p.ledcChannel, ((uint32_t)volumePercent * 512) / 100);
         p.gapDuration = duration / 10;
-        if (p.gapDuration < 20) p.gapDuration = 20;
+        if (p.gapDuration < 5) p.gapDuration = 0;
         if (p.gapDuration >= duration) p.gapDuration = 0;
     } else {
-        ledcDetachPin(p.buzzerPin);
+        ledcWriteTone(p.ledcChannel, 0);
         p.gapDuration = 0;
     }
-    p.noteStartedAt = millis();
     p.inGap = false;
-    p.inLoopPause = false;
 }
 
-bool advanceNote(MelodyPlayer& p) {
+void advanceNote(MelodyPlayer& p) {
     p.noteIndex++;
     if (p.noteIndex >= p.length) {
+        Serial.printf("[TRACK] Buzzer %d finished (%d notes) at %lums\n",
+            p.ledcChannel, p.length, millis());
         p.inLoopPause = true;
-        p.noteStartedAt = millis();
-        ledcDetachPin(p.buzzerPin);
-        return false;
+        ledcWrite(p.ledcChannel, 0);
+        return;
     }
-    playCurrentNote(p);
-    return true;
+    setupNote(p);
 }
 
 void updatePlayer(MelodyPlayer& p) {
-    if (!p.playing) return;
-    unsigned long now = millis();
-
-    if (p.inLoopPause) {
-        return;
-    }
-
-    if (p.inGap) {
-        if (now - p.noteStartedAt >= p.gapDuration) {
-            advanceNote(p);
-        }
-        return;
-    }
-
+    if (!p.playing || p.inLoopPause) return;
+    unsigned long elapsed = millis() - p.noteStartedAt;
     uint16_t duration = p.melody[p.noteIndex][1];
     uint16_t toneDuration = (p.gapDuration > 0)
         ? (duration - p.gapDuration) : duration;
 
-    if (now - p.noteStartedAt < toneDuration) return;
-
-    if (p.gapDuration > 0) {
-        ledcDetachPin(p.buzzerPin);
+    // Silence buzzer when tone portion ends (gap begins)
+    if (!p.inGap && p.gapDuration > 0 && elapsed >= toneDuration) {
+        ledcWrite(p.ledcChannel, 0);
         p.inGap = true;
-        p.noteStartedAt = now;
-    } else {
+    }
+
+    // Advance to next note when full duration ends (absolute timing)
+    if (elapsed >= duration) {
+        p.noteStartedAt += duration;
         advanceNote(p);
     }
 }
@@ -415,7 +448,7 @@ void updatePlayer(MelodyPlayer& p) {
 // ---------- track distribution ----------
 void assignTracks(SongEntry& song) {
     uint8_t available = 0;
-    for (uint8_t t = 0; t < 4; t++) {
+    for (uint8_t t = 0; t < MAX_TRACKS; t++) {
         if (song.tracks[t].notes && song.tracks[t].length > 0) available++;
     }
 
@@ -432,17 +465,16 @@ void assignTracks(SongEntry& song) {
 
     if (available == 1) {
         TrackData& t0 = song.tracks[0];
-        players[0].melody = t0.notes; players[0].length = t0.length;
-        players[0].octaveShift = 0;
-        players[1].melody = t0.notes; players[1].length = t0.length;
-        players[1].octaveShift = 1;
-        players[2].melody = t0.notes; players[2].length = t0.length;
-        players[2].octaveShift = -1;
-        players[3].melody = t0.notes; players[3].length = t0.length;
-        players[3].octaveShift = 0;
+        // Channel 4 shares LEDC Timer 0 with channel 0, so must use same shift
+        static const int8_t shifts[NUM_BUZZERS] = { 0, 1, -1, 0, 0 };
+        for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
+            players[i].melody = t0.notes;
+            players[i].length = t0.length;
+            players[i].octaveShift = shifts[i];
+        }
     } else {
         uint8_t assigned = 0;
-        for (uint8_t t = 0; t < 4 && assigned < NUM_BUZZERS; t++) {
+        for (uint8_t t = 0; t < MAX_TRACKS && assigned < NUM_BUZZERS; t++) {
             if (song.tracks[t].notes && song.tracks[t].length > 0) {
                 players[assigned].melody = song.tracks[t].notes;
                 players[assigned].length = song.tracks[t].length;
@@ -450,27 +482,18 @@ void assignTracks(SongEntry& song) {
                 assigned++;
             }
         }
-        TrackData& t0 = song.tracks[0];
-        if (t0.notes && t0.length > 0) {
-            int8_t shifts[] = { 1, -1 };
-            uint8_t shiftIdx = 0;
-            while (assigned < NUM_BUZZERS) {
-                players[assigned].melody = t0.notes;
-                players[assigned].length = t0.length;
-                players[assigned].octaveShift = shifts[shiftIdx % 2];
-                shiftIdx++;
-                assigned++;
-            }
-        }
+        // Extra buzzers stay silent for multi-track songs
     }
 
+    unsigned long startTime = millis();
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
         if (players[i].melody && players[i].length > 0) {
             players[i].noteIndex = 0;
             players[i].playing = true;
             players[i].inGap = false;
             players[i].inLoopPause = false;
-            playCurrentNote(players[i]);
+            players[i].noteStartedAt = startTime;
+            setupNote(players[i]);
         }
     }
 }
@@ -478,7 +501,7 @@ void assignTracks(SongEntry& song) {
 void stopAllBuzzers() {
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
         players[i].playing = false;
-        ledcDetachPin(buzzerPins[i]);
+        ledcWriteTone(i, 0);
     }
 }
 
@@ -533,6 +556,13 @@ transition:color .3s}
 .buz.on{background:var(--accent2);box-shadow:0 0 8px var(--accent2)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 .buz.on{animation:pulse 0.6s ease-in-out infinite}
+.vol-row{display:flex;align-items:center;gap:10px;padding:4px 20px 12px}
+.vol-row span{font-size:0.7rem;color:var(--dim)}
+.vol-row .vol-val{min-width:28px;text-align:right;font-variant-numeric:tabular-nums}
+.vol-row input[type=range]{flex:1;height:4px;-webkit-appearance:none;appearance:none;
+background:var(--border);border-radius:2px;outline:none}
+.vol-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;
+border-radius:50%;background:var(--accent);cursor:pointer}
 .songs{list-style:none;padding:0 12px}
 .songs li{display:flex;align-items:center;gap:10px;padding:12px;margin-bottom:2px;
 border-radius:8px;cursor:pointer;-webkit-tap-highlight-color:transparent;transition:background .15s}
@@ -569,6 +599,11 @@ transition:opacity .15s}
 <div class="buz" id="b2"></div>
 <div class="buz" id="b3"></div>
 </div>
+<div class="vol-row">
+<span>Vol</span>
+<input type="range" id="vol" min="0" max="100" value="20">
+<span class="vol-val" id="volVal">20%</span>
+</div>
 <ul class="songs" id="list"></ul>
 <div class="stop-bar">
 <button class="stop-btn" id="stop">STOP</button>
@@ -580,6 +615,8 @@ var list=document.getElementById('list');
 var now=document.getElementById('now');
 var buzEls=[document.getElementById('b0'),document.getElementById('b1'),
             document.getElementById('b2'),document.getElementById('b3')];
+var volSlider=document.getElementById('vol');
+var volVal=document.getElementById('volVal');
 var SERVER=window.location.hostname;
 
 function ui(){
@@ -606,6 +643,10 @@ function connect(){
       now.textContent='Ready';
       now.className='now-playing';
       setBuzzers(false);
+    } else if(e.data.startsWith('vol:')){
+      var v=parseInt(e.data.substring(4),10);
+      volSlider.value=v;
+      volVal.textContent=v+'%';
     }
   };
 }
@@ -626,6 +667,11 @@ function play(i){
 }
 document.getElementById('stop').addEventListener('click',function(){
   if(sock&&sock.readyState===1)sock.send('stop');
+});
+volSlider.addEventListener('input',function(){
+  var v=volSlider.value;
+  volVal.textContent=v+'%';
+  if(sock&&sock.readyState===1)sock.send('vol:'+v);
 });
 document.addEventListener('visibilitychange',function(){
   if(!document.hidden&&(!sock||sock.readyState!==1)){connected=false;ui();reconnect();}
@@ -675,8 +721,10 @@ static const char ICON_SVG[] PROGMEM = R"rawliteral(
 void enterState(State s);
 
 void startSong(uint16_t index) {
+    Serial.printf("[PLAY] startSong(%d) heap=%u\n", index, ESP.getFreeHeap());
     if (currentSongIndex >= 0 && currentSongIndex < SONG_COUNT) {
         freeSongTracks(songs[currentSongIndex]);
+        Serial.printf("[PLAY] Freed previous song #%d, heap=%u\n", currentSongIndex, ESP.getFreeHeap());
     }
 
     if (!parseSongTracks(index)) {
@@ -687,6 +735,10 @@ void startSong(uint16_t index) {
     currentSongIndex = index;
     assignTracks(songs[index]);
 
+    for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
+        Serial.printf("[PLAY] Buzzer %d: len=%d shift=%d playing=%d\n",
+            i, players[i].length, players[i].octaveShift, players[i].playing);
+    }
     Serial.printf("[PLAY] Starting: %s (%d tracks)\n",
         songs[index].name, songs[index].trackCount);
 }
@@ -721,6 +773,11 @@ void onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
             snprintf(msg, sizeof(msg), "playing:%s", songs[currentSongIndex].name);
             client->text(msg);
         }
+        {
+            char volMsg[8];
+            snprintf(volMsg, sizeof(volMsg), "vol:%d", volumePercent);
+            client->text(volMsg);
+        }
         break;
     case WS_EVT_DISCONNECT:
         Serial.printf("[WS] Client #%u disconnected\n", client->id());
@@ -738,11 +795,23 @@ void onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
                 int idx = atoi(numBuf);
                 if (idx >= 0 && idx < SONG_COUNT) {
                     if (state == PLAYING) {
+                        stateEnteredAt = millis(); // reset settle timer before transition to prevent cross-core race
                         stopAllBuzzers();
                     }
                     startSong(idx);
                     enterState(PLAYING);
                 }
+            } else if (len >= 5 && len <= 7 && memcmp(data, "vol:", 4) == 0) {
+                char numBuf[4];
+                memcpy(numBuf, data + 4, len - 4);
+                numBuf[len - 4] = '\0';
+                int v = atoi(numBuf);
+                if (v < 0) v = 0;
+                if (v > 100) v = 100;
+                volumePercent = v;
+                char volMsg[8];
+                snprintf(volMsg, sizeof(volMsg), "vol:%d", volumePercent);
+                ws.textAll(volMsg);
             }
         }
         break;
@@ -757,13 +826,15 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n[BOOT] Music Buzzer starting...");
+    Serial.printf("[BOOT] HEAP at start: %u bytes\n", ESP.getFreeHeap());
 
     // LEDC init — each buzzer on its own channel (channels 0-3 map to timers 0-3)
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
         ledcSetup(i, 1000, LEDC_RESOLUTION);
         ledcAttachPin(buzzerPins[i], i);
-        ledcDetachPin(buzzerPins[i]);
+        ledcWriteTone(i, 0);
     }
+    Serial.println("[BOOT] LEDC init done");
 
     // Stop button
     pinMode(PIN_STOP_BTN, INPUT_PULLUP);
@@ -788,6 +859,7 @@ void setup() {
     // WebSocket
     ws.onEvent(onWsEvent);
     server.addHandler(&ws);
+    Serial.println("[BOOT] WebSocket handler registered");
 
     // HTTP routes
     server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -818,7 +890,7 @@ void setup() {
                 n++;
             }
             uint8_t tc = songs[i].trackCount;
-            if (tc > 4) tc = 4;
+            if (tc > MAX_TRACKS) tc = MAX_TRACKS;
             response->printf("\",\"t\":%d}", tc);
         }
         response->print("]");
@@ -864,22 +936,32 @@ void loop() {
         updatePlayer(players[i]);
     }
 
-    // Synchronized looping: when all active players are in loop pause, restart together
-    if (state == PLAYING && anyPlayerActive() && allPlayersInLoopPause()) {
+    // Periodic playback status (every 2s)
+    if (state == PLAYING) {
+        static unsigned long lastStatusAt = 0;
         unsigned long now = millis();
-        unsigned long latestPause = 0;
-        for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
-            if (players[i].playing && players[i].inLoopPause) {
-                unsigned long elapsed = now - players[i].noteStartedAt;
-                if (elapsed < latestPause || latestPause == 0) latestPause = elapsed;
-            }
-        }
-        if (latestPause >= MELODY_LOOP_PAUSE_MS) {
+        if (now - lastStatusAt >= 2000) {
+            lastStatusAt = now;
+            Serial.printf("[STATUS] t=%lus | ", now / 1000);
             for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
                 if (players[i].playing) {
-                    players[i].noteIndex = 0;
-                    playCurrentNote(players[i]);
+                    Serial.printf("B%d:%d/%d ", i, players[i].noteIndex, players[i].length);
                 }
+            }
+            Serial.println();
+        }
+    }
+
+    // Synchronized looping: when all active players finish, restart together
+    if (state == PLAYING && anyPlayerActive() && allPlayersInLoopPause()) {
+        Serial.println("[LOOP] All tracks finished — restarting");
+        unsigned long startTime = millis();
+        for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
+            if (players[i].playing) {
+                players[i].noteIndex = 0;
+                players[i].inLoopPause = false;
+                players[i].noteStartedAt = startTime;
+                setupNote(players[i]);
             }
         }
     }
