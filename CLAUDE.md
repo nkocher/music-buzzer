@@ -49,9 +49,14 @@ Active branches:
 ```bash
 pio run              # Compile (auto-flashes on success via hook)
 pio run -t upload    # Flash to device
+pio run -t compiledb # Generate compile_commands.json for LSP
 ```
 
 **Serial Monitor**: Do NOT run `pio device monitor` - it hangs Claude Code. Ask the user to run it themselves and paste output back.
+
+## Related Projects
+
+- `nicholas-buzzer` (192.168.0.200) - Single buzzer version, shares `songs.h`
 
 ## Automations
 
