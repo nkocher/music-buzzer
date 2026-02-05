@@ -47,10 +47,17 @@ Active branches:
 ## Build Commands
 
 ```bash
-pio run              # Compile
+pio run              # Compile (auto-flashes on success via hook)
 pio run -t upload    # Flash to device
-pio device monitor   # Serial monitor
 ```
+
+**Serial Monitor**: Do NOT run `pio device monitor` - it hangs Claude Code. Ask the user to run it themselves and paste output back.
+
+## Automations
+
+- **Auto-flash**: Successful `pio run` automatically triggers `pio run -t upload`
+- **secrets.h protection**: Edits to secrets.h are blocked
+- **/flash skill**: User can invoke `/flash` for quick build+upload
 
 ## Code Style
 
