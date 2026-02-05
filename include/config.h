@@ -19,9 +19,6 @@
 #define NUM_BUZZERS 5
 #define MAX_TRACKS  5
 
-// LEDC channels (one per buzzer, each gets its own timer)
-#define LEDC_RESOLUTION 10
-
 // Stop button (HW-483 module)
 #define PIN_STOP_BTN 16
 
