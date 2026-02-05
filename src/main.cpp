@@ -32,12 +32,13 @@ static const uint32_t buzzerPinMasks[NUM_BUZZERS] = {
 void IRAM_ATTR audioISR() {
     uint32_t setMask = 0;
     uint32_t clearMask = 0;
+    bool anyActive = false;
 
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
         if (buzzerPWM[i].phaseInc == 0) {
-            clearMask |= buzzerPinMasks[i];
-            continue;
+            continue;  // Don't add to clearMask - pin is already LOW
         }
+        anyActive = true;
         buzzerPWM[i].phase += buzzerPWM[i].phaseInc;
 
         // Upper 9 bits as phase position (0-511)
@@ -48,6 +49,8 @@ void IRAM_ATTR audioISR() {
             clearMask |= buzzerPinMasks[i];
         }
     }
+
+    if (!anyActive) return;  // Early exit - no GPIO writes when idle
 
     if (setMask) GPIO.out_w1ts = setMask;
     if (clearMask) GPIO.out_w1tc = clearMask;
@@ -447,7 +450,7 @@ void setupNote(MelodyPlayer& p) {
         buzzerPWM[p.ledcChannel].phaseInc = ((uint64_t)freq << 32) / SAMPLE_RATE_HZ;
         buzzerPWM[p.ledcChannel].dutyOn = ((uint32_t)volumePercent * 512) / 100;
         p.gapDuration = duration / 10;
-        if (p.gapDuration < 5) p.gapDuration = 0;
+        if (p.gapDuration < 20) p.gapDuration = 20;
         if (p.gapDuration >= duration) p.gapDuration = 0;
     } else {
         buzzerPWM[p.ledcChannel].phaseInc = 0;
@@ -508,9 +511,9 @@ void assignTracks(SongEntry& song) {
 
     if (available == 1) {
         TrackData& t0 = song.tracks[0];
-        // Channel 4 shares LEDC Timer 0 with channel 0, so must use same shift
-        static const int8_t shifts[NUM_BUZZERS] = { 0, 1, -1, 0, 0 };
-        for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
+        // 3 buzzers: base + octave up + octave down for harmonic richness
+        static const int8_t shifts[3] = { 0, 1, -1 };
+        for (uint8_t i = 0; i < 3; i++) {
             players[i].melody = t0.notes;
             players[i].length = t0.length;
             players[i].octaveShift = shifts[i];
@@ -526,16 +529,6 @@ void assignTracks(SongEntry& song) {
                 assigned++;
             }
         }
-        // Fill remaining buzzers with track 0 (if any left unused)
-        TrackData& t0 = song.tracks[0];
-        if (t0.notes && t0.length > 0) {
-            for (uint8_t i = assigned; i < NUM_BUZZERS; i++) {
-                Serial.printf("[ASSIGN] Buzzer %d: Track 0 (doubled)\n", i);
-                players[i].melody = t0.notes;
-                players[i].length = t0.length;
-                players[i].octaveShift = 0;
-            }
-        }
     }
 
     unsigned long startTime = millis();
@@ -549,14 +542,34 @@ void assignTracks(SongEntry& song) {
             setupNote(players[i]);
         }
     }
+
+    // Switch buzzer pins to OUTPUT mode before enabling playback
+    for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
+        pinMode(buzzerPins[i], OUTPUT);
+        digitalWrite(buzzerPins[i], LOW);
+    }
+
+    // Enable timer ISR now that playback is configured
+    timerAlarmEnable(audioTimer);
 }
 
 void stopAllBuzzers() {
+    // Disable timer ISR first to stop all GPIO activity
+    timerAlarmDisable(audioTimer);
+
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
         players[i].playing = false;
         buzzerPWM[i].phaseInc = 0;
         buzzerPWM[i].phase = 0;
         buzzerPWM[i].dutyOn = 0;
+    }
+    // Force all buzzer pins LOW immediately (prevents stuck-high pins)
+    GPIO.out_w1tc = buzzerPinMasks[0] | buzzerPinMasks[1] | buzzerPinMasks[2] |
+                    buzzerPinMasks[3] | buzzerPinMasks[4];
+
+    // Switch pins to INPUT mode (high-impedance) for true silence
+    for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
+        pinMode(buzzerPins[i], INPUT);
     }
 }
 
@@ -883,19 +896,20 @@ void setup() {
     Serial.println("\n[BOOT] Music Buzzer starting...");
     Serial.printf("[BOOT] HEAP at start: %u bytes\n", ESP.getFreeHeap());
 
-    // GPIO init for buzzers (software PWM via timer ISR)
+    // GPIO init for buzzers — start in INPUT mode (high-impedance) for silence
+    // Pins switched to OUTPUT only during playback to avoid idle noise
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
-        pinMode(buzzerPins[i], OUTPUT);
-        digitalWrite(buzzerPins[i], LOW);
+        pinMode(buzzerPins[i], INPUT);
     }
 
     // Timer ISR for software PWM — 40kHz sample rate
     // Timer 0, prescaler 2 (80MHz/2=40MHz), count up
+    // Timer starts DISABLED - enabled only during playback to avoid idle noise
     audioTimer = timerBegin(0, TIMER_DIVIDER, true);
     timerAttachInterrupt(audioTimer, audioISR, true);
     timerAlarmWrite(audioTimer, 1000, true);  // 40MHz/1000 = 40kHz, auto-reload
-    timerAlarmEnable(audioTimer);
-    Serial.println("[BOOT] Timer ISR init done (40kHz software PWM)");
+    // Note: timerAlarmEnable() called in assignTracks() when playback starts
+    Serial.println("[BOOT] Timer ISR init done (40kHz software PWM, idle until play)");
 
     // Stop button
     pinMode(PIN_STOP_BTN, INPUT_PULLUP);
