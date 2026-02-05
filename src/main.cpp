@@ -11,6 +11,48 @@ volatile unsigned long stateEnteredAt = 0;
 unsigned long lastWifiCheck = 0;
 uint8_t volumePercent = DEFAULT_VOLUME;
 
+// ---------- Software PWM via timer ISR (replaces LEDC to avoid first-cycle glitch) ----------
+#define SAMPLE_RATE_HZ 40000
+#define TIMER_DIVIDER  2      // 80MHz / 2 = 40MHz, then alarm at 1000 ticks = 40kHz
+
+struct BuzzerPWM {
+    volatile uint32_t phase;      // 32-bit phase accumulator
+    volatile uint32_t phaseInc;   // Phase increment (determines frequency)
+    volatile uint16_t dutyOn;     // PWM duty threshold (0-512)
+};
+volatile BuzzerPWM buzzerPWM[NUM_BUZZERS] = {};
+hw_timer_t* audioTimer = nullptr;
+
+// Pin masks for direct GPIO manipulation (GPIO 4,5,6,7 are on GPIO.out, GPIO 15 is also on GPIO.out)
+static const uint32_t buzzerPinMasks[NUM_BUZZERS] = {
+    (1UL << PIN_BUZ0), (1UL << PIN_BUZ1), (1UL << PIN_BUZ2),
+    (1UL << PIN_BUZ3), (1UL << PIN_BUZ4)
+};
+
+void IRAM_ATTR audioISR() {
+    uint32_t setMask = 0;
+    uint32_t clearMask = 0;
+
+    for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
+        if (buzzerPWM[i].phaseInc == 0) {
+            clearMask |= buzzerPinMasks[i];
+            continue;
+        }
+        buzzerPWM[i].phase += buzzerPWM[i].phaseInc;
+
+        // Upper 9 bits as phase position (0-511)
+        uint16_t pos = buzzerPWM[i].phase >> 23;
+        if (pos < buzzerPWM[i].dutyOn) {
+            setMask |= buzzerPinMasks[i];
+        } else {
+            clearMask |= buzzerPinMasks[i];
+        }
+    }
+
+    if (setMask) GPIO.out_w1ts = setMask;
+    if (clearMask) GPIO.out_w1tc = clearMask;
+}
+
 // ---------- note frequency helper ----------
 static const uint16_t NOTE_FREQS[12] = { 262,277,294,311,330,349,370,392,415,440,466,494 }; // C4..B4
 
@@ -400,14 +442,15 @@ void setupNote(MelodyPlayer& p) {
         if (freq < 65) freq = 65;   // C2, lowest usable on most passive buzzers
         if (freq > 4000) freq = 4000;
 
-        // ledcWriteTone changes freq without stopping PWM (no glitch between notes)
-        ledcWriteTone(p.ledcChannel, freq);
-        ledcWrite(p.ledcChannel, ((uint32_t)volumePercent * 512) / 100);
+        // Software PWM via timer ISR — phase-continuous, no first-cycle glitch
+        buzzerPWM[p.ledcChannel].phase = 0;  // Reset phase for clean note attack
+        buzzerPWM[p.ledcChannel].phaseInc = ((uint64_t)freq << 32) / SAMPLE_RATE_HZ;
+        buzzerPWM[p.ledcChannel].dutyOn = ((uint32_t)volumePercent * 512) / 100;
         p.gapDuration = duration / 10;
         if (p.gapDuration < 5) p.gapDuration = 0;
         if (p.gapDuration >= duration) p.gapDuration = 0;
     } else {
-        ledcWriteTone(p.ledcChannel, 0);
+        buzzerPWM[p.ledcChannel].phaseInc = 0;
         p.gapDuration = 0;
     }
     p.inGap = false;
@@ -419,7 +462,7 @@ void advanceNote(MelodyPlayer& p) {
         Serial.printf("[TRACK] Buzzer %d finished (%d notes) at %lums\n",
             p.ledcChannel, p.length, millis());
         p.inLoopPause = true;
-        ledcWrite(p.ledcChannel, 0);
+        buzzerPWM[p.ledcChannel].dutyOn = 0;  // Silence via duty cycle
         return;
     }
     setupNote(p);
@@ -434,7 +477,7 @@ void updatePlayer(MelodyPlayer& p) {
 
     // Silence buzzer when tone portion ends (gap begins)
     if (!p.inGap && p.gapDuration > 0 && elapsed >= toneDuration) {
-        ledcWrite(p.ledcChannel, 0);
+        buzzerPWM[p.ledcChannel].dutyOn = 0;  // Silence via duty cycle
         p.inGap = true;
     }
 
@@ -476,13 +519,23 @@ void assignTracks(SongEntry& song) {
         uint8_t assigned = 0;
         for (uint8_t t = 0; t < MAX_TRACKS && assigned < NUM_BUZZERS; t++) {
             if (song.tracks[t].notes && song.tracks[t].length > 0) {
+                Serial.printf("[ASSIGN] Buzzer %d: Track %d\n", assigned, t);
                 players[assigned].melody = song.tracks[t].notes;
                 players[assigned].length = song.tracks[t].length;
                 players[assigned].octaveShift = 0;
                 assigned++;
             }
         }
-        // Extra buzzers stay silent for multi-track songs
+        // Fill remaining buzzers with track 0 (if any left unused)
+        TrackData& t0 = song.tracks[0];
+        if (t0.notes && t0.length > 0) {
+            for (uint8_t i = assigned; i < NUM_BUZZERS; i++) {
+                Serial.printf("[ASSIGN] Buzzer %d: Track 0 (doubled)\n", i);
+                players[i].melody = t0.notes;
+                players[i].length = t0.length;
+                players[i].octaveShift = 0;
+            }
+        }
     }
 
     unsigned long startTime = millis();
@@ -501,7 +554,9 @@ void assignTracks(SongEntry& song) {
 void stopAllBuzzers() {
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
         players[i].playing = false;
-        ledcWriteTone(i, 0);
+        buzzerPWM[i].phaseInc = 0;
+        buzzerPWM[i].phase = 0;
+        buzzerPWM[i].dutyOn = 0;
     }
 }
 
@@ -828,13 +883,19 @@ void setup() {
     Serial.println("\n[BOOT] Music Buzzer starting...");
     Serial.printf("[BOOT] HEAP at start: %u bytes\n", ESP.getFreeHeap());
 
-    // LEDC init — each buzzer on its own channel (channels 0-3 map to timers 0-3)
+    // GPIO init for buzzers (software PWM via timer ISR)
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
-        ledcSetup(i, 1000, LEDC_RESOLUTION);
-        ledcAttachPin(buzzerPins[i], i);
-        ledcWriteTone(i, 0);
+        pinMode(buzzerPins[i], OUTPUT);
+        digitalWrite(buzzerPins[i], LOW);
     }
-    Serial.println("[BOOT] LEDC init done");
+
+    // Timer ISR for software PWM — 40kHz sample rate
+    // Timer 0, prescaler 2 (80MHz/2=40MHz), count up
+    audioTimer = timerBegin(0, TIMER_DIVIDER, true);
+    timerAttachInterrupt(audioTimer, audioISR, true);
+    timerAlarmWrite(audioTimer, 1000, true);  // 40MHz/1000 = 40kHz, auto-reload
+    timerAlarmEnable(audioTimer);
+    Serial.println("[BOOT] Timer ISR init done (40kHz software PWM)");
 
     // Stop button
     pinMode(PIN_STOP_BTN, INPUT_PULLUP);
