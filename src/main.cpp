@@ -545,10 +545,12 @@ void assignTracks(SongEntry& song) {
         }
     }
 
-    // Switch buzzer pins to OUTPUT mode before enabling playback
+    // Only set OUTPUT for buzzers that are playing (unused stay in INPUT/hi-Z)
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
-        pinMode(buzzerPins[i], OUTPUT);
-        digitalWrite(buzzerPins[i], LOW);
+        if (players[i].playing) {
+            pinMode(buzzerPins[i], OUTPUT);
+            digitalWrite(buzzerPins[i], LOW);
+        }
     }
 
     // Enable timer ISR now that playback is configured
