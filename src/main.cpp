@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <LittleFS.h>
 #include "config.h"
 #include "songs.h"
+#include "mini_gpt.h"
 
 // ---------- state ----------
 enum State { IDLE, PLAYING };
@@ -10,6 +12,29 @@ volatile State state = IDLE;
 volatile unsigned long stateEnteredAt = 0;
 unsigned long lastWifiCheck = 0;
 uint8_t volumePercent = DEFAULT_VOLUME;
+
+// ---------- GPT generation ----------
+MiniGPT gptModel;
+bool gptLoaded = false;
+volatile bool generating = false;
+volatile bool genAbort = false;
+float genTemperature = 0.8f;
+QueueHandle_t genResultQueue;
+QueueHandle_t wsMessageQueue;  // For thread-safe WS messaging from core 0
+
+// Send a WebSocket message from any core (queued, drained in loop on core 1)
+static void queueWsMessage(const char* msg) {
+    char* copy = strdup(msg);
+    if (copy) {
+        if (xQueueSend(wsMessageQueue, &copy, 0) != pdTRUE) {
+            free(copy);  // Queue full, drop message
+        }
+    }
+}
+
+// Forward declarations
+void playGeneratedMML(char* mml);
+void enterState(State s);
 
 // ---------- Software PWM via timer ISR (replaces LEDC to avoid first-cycle glitch) ----------
 #define SAMPLE_RATE_HZ 40000
@@ -596,6 +621,121 @@ bool anyPlayerActive() {
 AsyncWebServer server(SERVER_PORT);
 AsyncWebSocket ws("/ws");
 
+// ---------- GPT streaming callback and generation task ----------
+void streamCallback(const char* token, void* userData) {
+    if (genAbort) return;
+    char msg[64];
+    snprintf(msg, sizeof(msg), "gen:t:%s", token);
+    queueWsMessage(msg);
+}
+
+// Storage for generated song playback (persists until next gen or song play)
+static char* genMmlBuf = nullptr;
+
+void playGeneratedMML(char* mml) {
+    // Free previous generated song if any
+    if (currentSongIndex >= 0 && currentSongIndex < SONG_COUNT) {
+        freeSongTracks(songs[currentSongIndex]);
+    }
+
+    // Use the last slot in songs[] as a temporary generated song entry
+    // This avoids needing a separate SongEntry allocation
+    uint16_t genIdx = SONG_COUNT;  // One past the loaded songs
+    if (genIdx >= MAX_SONGS) {
+        Serial.println("[GPT] No song slot available");
+        return;
+    }
+
+    // Free old gen buffer
+    if (genMmlBuf) {
+        free(genMmlBuf);
+        genMmlBuf = nullptr;
+    }
+    genMmlBuf = mml;  // Take ownership of the buffer
+
+    // Ensure it has the prefix for parseMML
+    if (strncmp(genMmlBuf, "MML@", 4) != 0) {
+        Serial.println("[GPT] Generated MML missing prefix");
+        return;
+    }
+
+    // Count tracks
+    uint8_t tc = countMMLTracks(genMmlBuf);
+    Serial.printf("[GPT] Playing generated melody (%d tracks)\n", tc);
+
+    // Parse into temporary song entry
+    SongEntry& genSong = songs[genIdx];
+    genSong.parsed = false;
+    genSong.fmt = FMT_MML;
+    genSong.trackCount = tc;
+    genSong.name = "Generated Melody";
+    genSong.progmemStr = nullptr;  // Not in PROGMEM
+    for (uint8_t t = 0; t < MAX_TRACKS; t++) {
+        genSong.tracks[t] = { nullptr, 0 };
+    }
+
+    // Parse each track using existing MML parser (it expects a RAM string)
+    uint16_t (*tempBuf)[2] = (uint16_t(*)[2])malloc(MAX_NOTES_PER_SONG * sizeof(uint16_t[2]));
+    if (!tempBuf) {
+        Serial.println("[GPT] tempBuf malloc failed");
+        return;
+    }
+
+    uint8_t tracksToParse = tc < MAX_TRACKS ? tc : MAX_TRACKS;
+    for (uint8_t t = 0; t < tracksToParse; t++) {
+        uint16_t count = parseMML(genMmlBuf, tempBuf, MAX_NOTES_PER_SONG, t);
+        Serial.printf("[GPT] Track %d: %d notes\n", t, count);
+        if (count > 0) {
+            uint16_t (*notes)[2] = (uint16_t(*)[2])malloc(count * sizeof(uint16_t[2]));
+            if (notes) {
+                memcpy(notes, tempBuf, count * sizeof(uint16_t[2]));
+                genSong.tracks[t] = { notes, count };
+            }
+        }
+    }
+    free(tempBuf);
+
+    genSong.parsed = true;
+    currentSongIndex = genIdx;
+    assignTracks(genSong);
+    enterState(PLAYING);
+}
+
+void genTask(void* param) {
+    // PSRAM check
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < 512 * 1024) {
+        queueWsMessage("gen:err:low memory");
+        generating = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    queueWsMessage("gen:start");
+    char* mml = gpt_generate(&gptModel, "MML@", 900, genTemperature,
+                              streamCallback, nullptr);
+
+    if (mml && !genAbort) {
+        // Send full result
+        size_t len = strlen(mml);
+        char* msg = (char*)malloc(len + 16);
+        if (msg) {
+            snprintf(msg, len + 16, "gen:done:%s", mml);
+            queueWsMessage(msg);
+            free(msg);
+        }
+        // Queue for playback (transfer ownership of mml to main loop)
+        if (xQueueSend(genResultQueue, &mml, 0) != pdTRUE) {
+            free(mml);  // Queue full, free it
+        }
+    } else {
+        if (mml) free(mml);
+        queueWsMessage(genAbort ? "gen:err:aborted" : "gen:err:failed");
+    }
+
+    generating = false;
+    vTaskDelete(NULL);
+}
+
 // ---------- PWA ----------
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -656,6 +796,10 @@ background:var(--danger);color:#fff;font-size:1rem;font-weight:600;cursor:pointe
 touch-action:manipulation;-webkit-tap-highlight-color:transparent;letter-spacing:0.02em;
 transition:opacity .15s}
 .stop-btn:active{opacity:.8}
+.gen-link{display:none;padding:8px 20px 12px}
+.gen-link a{display:block;padding:12px;border-radius:8px;background:var(--accent);color:#fff;
+font-size:0.9rem;font-weight:600;text-align:center;text-decoration:none;transition:opacity .15s}
+.gen-link a:active{opacity:.8}
 </style>
 </head>
 <body>
@@ -676,6 +820,9 @@ transition:opacity .15s}
 <input type="range" id="vol" min="0" max="100" value="20">
 <span class="vol-val" id="volVal">20%</span>
 </div>
+<div class="gen-link" id="genLink">
+<a href="/generate">Generate Melody</a>
+</div>
 <ul class="songs" id="list"></ul>
 <div class="stop-bar">
 <button class="stop-btn" id="stop">STOP</button>
@@ -689,6 +836,7 @@ var buzEls=[document.getElementById('b0'),document.getElementById('b1'),
             document.getElementById('b2'),document.getElementById('b3')];
 var volSlider=document.getElementById('vol');
 var volVal=document.getElementById('volVal');
+var genLink=document.getElementById('genLink');
 var SERVER=window.location.hostname;
 
 function ui(){
@@ -719,6 +867,12 @@ function connect(){
       var v=parseInt(e.data.substring(4),10);
       volSlider.value=v;
       volVal.textContent=v+'%';
+    } else if(e.data==='status:gpt:1'){
+      genLink.style.display='block';
+    } else if(e.data.startsWith('gen:done:')){
+      now.textContent='Now Playing: Generated Melody';
+      now.className='now-playing active';
+      setBuzzers(true);
     }
   };
 }
@@ -789,6 +943,128 @@ static const char ICON_SVG[] PROGMEM = R"rawliteral(
 </svg>
 )rawliteral";
 
+static const char GENERATE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0f0f0f">
+<title>Generate Melody</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f0f0f;--card:#1a1a1a;--border:#2a2a2a;--text:#e0e0e0;--dim:#666;
+--accent:#6c63ff;--accent2:#4ecdc4;--danger:#e53e3e;--success:#38a169}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);
+-webkit-user-select:none;user-select:none;padding:16px 20px}
+.back{display:inline-block;color:var(--accent);text-decoration:none;font-size:0.85rem;margin-bottom:16px}
+.back:active{opacity:.7}
+h1{font-size:1.1rem;font-weight:600;margin-bottom:16px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--danger);display:inline-block;
+vertical-align:middle;margin-left:8px;transition:background .3s}
+.dot.ok{background:var(--success)}
+.controls{margin-bottom:16px}
+.row{display:flex;gap:8px;margin-bottom:12px}
+.gen-btn{flex:1;padding:14px;border:none;border-radius:8px;background:var(--accent);color:#fff;
+font-size:1rem;font-weight:600;cursor:pointer;transition:opacity .15s}
+.gen-btn:disabled{opacity:.4;cursor:default}
+.gen-btn:active:not(:disabled){opacity:.8}
+.cancel-btn{padding:14px 20px;border:none;border-radius:8px;background:var(--danger);color:#fff;
+font-size:1rem;font-weight:600;cursor:pointer;display:none}
+.slider-row{display:flex;align-items:center;gap:10px}
+.slider-row span{font-size:0.8rem;color:var(--dim)}
+.slider-row input[type=range]{flex:1;height:4px;-webkit-appearance:none;appearance:none;
+background:var(--border);border-radius:2px;outline:none}
+.slider-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;
+border-radius:50%;background:var(--accent2);cursor:pointer}
+.val{min-width:28px;text-align:right;font-variant-numeric:tabular-nums}
+.output{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;
+font-family:monospace;font-size:0.8rem;color:var(--accent2);min-height:120px;max-height:50vh;
+overflow-y:auto;white-space:pre-wrap;word-break:break-all;display:none;margin-bottom:16px}
+.status{font-size:0.8rem;color:var(--dim);text-align:center}
+</style>
+</head>
+<body>
+<a class="back" href="/">&larr; Back to Songs</a>
+<h1>Generate Melody<span class="dot" id="dot"></span></h1>
+<div class="controls">
+<div class="row">
+<button class="gen-btn" id="genBtn">Generate</button>
+<button class="cancel-btn" id="cancelBtn">Cancel</button>
+</div>
+<div class="slider-row">
+<span>Temperature</span>
+<input type="range" id="temp" min="1" max="15" value="8" step="1">
+<span class="val" id="tempVal">0.8</span>
+</div>
+</div>
+<div class="output" id="output"></div>
+<div class="status" id="status"></div>
+<script>
+var sock=null,connected=false,rTimer=null;
+var dot=document.getElementById('dot');
+var genBtn=document.getElementById('genBtn');
+var cancelBtn=document.getElementById('cancelBtn');
+var output=document.getElementById('output');
+var temp=document.getElementById('temp');
+var tempVal=document.getElementById('tempVal');
+var status=document.getElementById('status');
+var SERVER=window.location.hostname;
+
+function reconnect(){if(!rTimer)rTimer=setTimeout(function(){rTimer=null;connect();},3000);}
+function connect(){
+  if(sock){sock.onopen=sock.onclose=sock.onerror=sock.onmessage=null;try{sock.close();}catch(e){}}
+  try{sock=new WebSocket('ws://'+SERVER+'/ws');}catch(e){reconnect();return;}
+  sock.onopen=function(){connected=true;dot.className='dot ok';};
+  sock.onclose=function(){connected=false;dot.className='dot';reconnect();};
+  sock.onerror=function(){connected=false;dot.className='dot';reconnect();};
+  sock.onmessage=function(e){
+    if(e.data==='gen:start'){
+      genBtn.disabled=true;genBtn.textContent='Generating...';
+      cancelBtn.style.display='';
+      output.textContent='';output.style.display='block';
+      status.textContent='';
+    } else if(e.data.startsWith('gen:t:')){
+      output.textContent+=e.data.substring(6);
+      output.scrollTop=output.scrollHeight;
+    } else if(e.data.startsWith('gen:done:')){
+      genBtn.disabled=false;genBtn.textContent='Generate';
+      cancelBtn.style.display='none';
+      status.textContent='Now playing generated melody';
+    } else if(e.data.startsWith('gen:err:')){
+      genBtn.disabled=false;genBtn.textContent='Generate';
+      cancelBtn.style.display='none';
+      var err=e.data.substring(8);
+      if(err!=='aborted') status.textContent='Error: '+err;
+      else status.textContent='Generation cancelled';
+    } else if(e.data.startsWith('playing:')){
+      status.textContent='Now Playing: '+e.data.substring(8);
+    } else if(e.data==='stopped'){
+      status.textContent='';
+    }
+  };
+}
+genBtn.addEventListener('click',function(){
+  if(sock&&sock.readyState===1)sock.send('gen');
+});
+cancelBtn.addEventListener('click',function(){
+  if(sock&&sock.readyState===1)sock.send('gen:stop');
+});
+temp.addEventListener('input',function(){
+  var v=(temp.value/10).toFixed(1);
+  tempVal.textContent=v;
+  if(sock&&sock.readyState===1)sock.send('gen:temp:'+v);
+});
+document.addEventListener('visibilitychange',function(){
+  if(!document.hidden&&(!sock||sock.readyState!==1)){connected=false;dot.className='dot';reconnect();}
+});
+connect();
+</script>
+</body>
+</html>
+)rawliteral";
+
 // ---------- state management ----------
 void enterState(State s);
 
@@ -850,6 +1126,8 @@ void onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
             snprintf(volMsg, sizeof(volMsg), "vol:%d", volumePercent);
             client->text(volMsg);
         }
+        // Send GPT model status
+        client->text(gptLoaded ? "status:gpt:1" : "status:gpt:0");
         break;
     case WS_EVT_DISCONNECT:
         Serial.printf("[WS] Client #%u disconnected\n", client->id());
@@ -884,6 +1162,30 @@ void onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
                 char volMsg[8];
                 snprintf(volMsg, sizeof(volMsg), "vol:%d", volumePercent);
                 ws.textAll(volMsg);
+            } else if (len == 3 && memcmp(data, "gen", 3) == 0) {
+                if (!gptLoaded) {
+                    client->text("gen:err:no model");
+                } else if (generating) {
+                    client->text("gen:err:busy");
+                } else {
+                    generating = true;
+                    genAbort = false;
+                    xTaskCreatePinnedToCore(genTask, "gpt_gen", 8192, nullptr, 1, nullptr, 0);
+                }
+            } else if (len >= 9 && memcmp(data, "gen:temp:", 9) == 0) {
+                char tbuf[8];
+                size_t tlen = len - 9;
+                if (tlen > 7) tlen = 7;
+                memcpy(tbuf, data + 9, tlen);
+                tbuf[tlen] = '\0';
+                float t = atof(tbuf);
+                if (t >= 0.1f && t <= 1.5f) {
+                    genTemperature = t;
+                    Serial.printf("[GPT] Temperature set to %.2f\n", genTemperature);
+                }
+            } else if (len == 8 && memcmp(data, "gen:stop", 8) == 0) {
+                genAbort = true;
+                Serial.println("[GPT] Generation abort requested");
             }
         }
         break;
@@ -935,6 +1237,21 @@ void setup() {
     parseSongDefs();
     Serial.printf("[HEAP] Free after song defs: %u bytes\n", ESP.getFreeHeap());
 
+    // GPT model loading (graceful — firmware works without it)
+    if (!LittleFS.begin(true)) {
+        Serial.println("[GPT] LittleFS mount failed");
+    } else {
+        gptLoaded = gpt_load(&gptModel, "/model.bin");
+        if (gptLoaded) {
+            Serial.printf("[GPT] Model loaded! heap=%u, psram=%u\n",
+                ESP.getFreeHeap(), ESP.getFreePsram());
+        } else {
+            Serial.println("[GPT] Model not found or failed — continuing without GPT");
+        }
+    }
+    genResultQueue = xQueueCreate(1, sizeof(char*));
+    wsMessageQueue = xQueueCreate(32, sizeof(char*));
+
     // WebSocket
     ws.onEvent(onWsEvent);
     server.addHandler(&ws);
@@ -943,6 +1260,11 @@ void setup() {
     // HTTP routes
     server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
         AsyncWebServerResponse* response = request->beginResponse(200, "text/html", INDEX_HTML);
+        response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        request->send(response);
+    });
+    server.on("/generate", HTTP_GET, [](AsyncWebServerRequest* request) {
+        AsyncWebServerResponse* response = request->beginResponse(200, "text/html", GENERATE_HTML);
         response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
         request->send(response);
     });
@@ -1009,6 +1331,27 @@ void loop() {
     }
 
     ws.cleanupClients();
+
+    // Drain WebSocket message queue (thread-safe relay from core 0 genTask)
+    {
+        char* wsMsg = nullptr;
+        while (xQueueReceive(wsMessageQueue, &wsMsg, 0) == pdTRUE && wsMsg) {
+            ws.textAll(wsMsg);
+            free(wsMsg);
+        }
+    }
+
+    // Check for generated melody to play
+    {
+        char* genMml = nullptr;
+        if (xQueueReceive(genResultQueue, &genMml, 0) == pdTRUE && genMml) {
+            if (state == PLAYING) {
+                stopAllBuzzers();
+            }
+            playGeneratedMML(genMml);
+            // genMml ownership transferred to playGeneratedMML
+        }
+    }
 
     // Update all players
     for (uint8_t i = 0; i < NUM_BUZZERS; i++) {
