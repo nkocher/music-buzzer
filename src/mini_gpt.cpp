@@ -68,14 +68,43 @@ static void softmax(float* x, int n) {
     }
 }
 
-// Sample token from logits with temperature
-static int sample_token(const float* logits, int vocab_size, float temperature) {
+// Sample token from logits with temperature and top-k filtering
+static int sample_token(const float* logits, int vocab_size, float temperature, int top_k = 40) {
     // Copy and apply temperature
     float* probs = (float*)malloc(vocab_size * sizeof(float));
     if (!probs) return 0;
 
     for (int i = 0; i < vocab_size; i++) {
         probs[i] = logits[i] / temperature;
+    }
+
+    // Apply top-k filtering
+    if (top_k > 0 && top_k < vocab_size) {
+        // Find the top_k-th largest value
+        float* sorted_logits = (float*)malloc(vocab_size * sizeof(float));
+        if (sorted_logits) {
+            memcpy(sorted_logits, probs, vocab_size * sizeof(float));
+
+            // Simple selection: find k-th largest by partial sort
+            for (int i = 0; i < top_k; i++) {
+                for (int j = i + 1; j < vocab_size; j++) {
+                    if (sorted_logits[j] > sorted_logits[i]) {
+                        float tmp = sorted_logits[i];
+                        sorted_logits[i] = sorted_logits[j];
+                        sorted_logits[j] = tmp;
+                    }
+                }
+            }
+            float threshold = sorted_logits[top_k - 1];
+            free(sorted_logits);
+
+            // Zero out logits below threshold
+            for (int i = 0; i < vocab_size; i++) {
+                if (probs[i] < threshold) {
+                    probs[i] = -1e9f;  // Large negative to avoid NaN in softmax
+                }
+            }
+        }
     }
 
     softmax(probs, vocab_size);
@@ -571,7 +600,28 @@ char* gpt_generate(MiniGPT* model, const char* prompt, int max_tokens,
     String result = prompt;
     int tokens_generated = 0;
 
+    // Repetition penalty tracking
+    static constexpr int REP_WINDOW = 30;
+    static constexpr float REP_PENALTY = 1.2f;
+    int recent_tokens[REP_WINDOW];
+    int recent_count = 0;
+    int recent_idx = 0;
+
     while (tokens_generated < max_tokens && model->pos < model->config.block_size - 1) {
+        // Apply repetition penalty
+        for (int i = 0; i < recent_count; i++) {
+            int tok = recent_tokens[i];
+            if (tok >= 0 && tok < model->config.vocab_size) {
+                float* logit = &model->buffers.logits[tok];
+                // Sign-aware penalty: reduce probability regardless of logit sign
+                if (*logit > 0) {
+                    *logit /= REP_PENALTY;
+                } else {
+                    *logit *= REP_PENALTY;  // Makes negative logits MORE negative
+                }
+            }
+        }
+
         // Sample next token
         int next_token = sample_token(model->buffers.logits, model->config.vocab_size, temperature);
 
@@ -589,6 +639,11 @@ char* gpt_generate(MiniGPT* model, const char* prompt, int max_tokens,
         if (cb) {
             cb(token_str, user_data);
         }
+
+        // Track token for repetition penalty
+        recent_tokens[recent_idx] = next_token;
+        recent_idx = (recent_idx + 1) % REP_WINDOW;
+        if (recent_count < REP_WINDOW) recent_count++;
 
         // Forward pass for next token
         gpt_forward_token(model, next_token);
