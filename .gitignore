@@ -3,3 +3,4 @@
 include/secrets.h
 .worktrees/
 .DS_Store
+CLAUDE.md
